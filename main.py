@@ -70,16 +70,24 @@ user_df = user_df.drop(categorical_cols, axis=1)
 user_df = pd.concat([user_df, encoded_user_df], axis=1)
 
 
-# Ensure the order of columns matches the training data features
-# This is crucial for correct prediction. You would typically save the column order
-# from your training data features (X_train) and use it here.
-expected_columns = ['year', 'km_driven', 'owner_First Owner', 'owner_Fourth & Above Owner',
-                    'owner_Second Owner', 'owner_Test Drive Car', 'owner_Third Owner',
-                    'fuel_CNG', 'fuel_Diesel', 'fuel_Electric', 'fuel_LPG', 'fuel_Petrol',
-                    'seller_type_Dealer', 'seller_type_Individual', 'seller_type_Trustmark Dealer',
-                    'transmission_Automatic', 'transmission_Manual']
+# Ensure the order of columns matches the training data features.
+# Prefer to use the feature names recorded on the fitted scaler (if available).
+try:
+    if hasattr(scaler, 'feature_names_in_'):
+        expected_columns = list(scaler.feature_names_in_)
+    else:
+        raise AttributeError
+except Exception:
+    # Fallback: this should match the column order used during training. Keep
+    # the hardcoded list as a fallback if the scaler wasn't fitted from a
+    # DataFrame (older sklearn versions or a plain numpy-based scaler).
+    expected_columns = ['year', 'km_driven', 'owner_First Owner', 'owner_Fourth & Above Owner',
+                        'owner_Second Owner', 'owner_Test Drive Car', 'owner_Third Owner',
+                        'fuel_CNG', 'fuel_Diesel', 'fuel_Electric', 'fuel_LPG', 'fuel_Petrol',
+                        'seller_type_Dealer', 'seller_type_Individual', 'seller_type_Trustmark Dealer',
+                        'transmission_Automatic', 'transmission_Manual']
 
-# Add missing columns with a value of 0 and ensure the order is correct
+# Add any missing columns that the scaler expects with a sensible default of 0.
 for col in expected_columns:
     if col not in user_df.columns:
         user_df[col] = 0
@@ -90,14 +98,59 @@ user_df = user_df[expected_columns]
 
 # Scale the user_df DataFrame using the fitted scaler
 user_df_scaled = scaler.transform(user_df)
-user_df_scaled = pd.DataFrame(user_df_scaled, columns=user_df.columns)
+# The scaler may have been fitted including or excluding certain columns (in
+# this repo the scaler was fitted including the target 'selling_price'). The
+# transformed DataFrame uses the scaler's feature order (we used
+# scaler.feature_names_in_ to build `user_df`), so make a DataFrame with those
+# column names.
+scaler_feature_names = list(scaler.feature_names_in_) if hasattr(scaler, 'feature_names_in_') else list(user_df.columns)
+user_df_scaled = pd.DataFrame(user_df_scaled, columns=scaler_feature_names)
+
+# Models expect a specific set of features. Prefer the linear model's
+# feature_names_in_ (both models were trained on the same features here).
+if hasattr(linear_reg_model, 'feature_names_in_'):
+    model_features = list(linear_reg_model.feature_names_in_)
+else:
+    # Fallback: use the intersection of scaler columns and current user_df
+    model_features = [c for c in scaler_feature_names if c in user_df.columns]
+
+# Ensure model input contains exactly the features expected by the model.
+# Add any missing model features with zeros, and drop any extras (like
+# 'selling_price' which was present for the scaler but not used by the models).
+for col in model_features:
+    if col not in user_df_scaled.columns:
+        user_df_scaled[col] = 0
+model_input = user_df_scaled[model_features]
 
 
 if st.sidebar.button("Predict Selling Price"):
-    # Make predictions
-    linear_reg_prediction = linear_reg_model.predict(user_df_scaled)
-    lasso_reg_prediction = lasso_reg_model.predict(user_df_scaled)
+    # Make predictions using only the features the models expect
+    linear_reg_prediction = linear_reg_model.predict(model_input)
+    lasso_reg_prediction = lasso_reg_model.predict(model_input)
+    # The models appear to predict the target in the scaled space because
+    # during training the scaler was fit including the target column
+    # 'selling_price'. We therefore inverse-transform the model outputs to
+    # get prices on the original scale using the scaler's mean and scale for
+    # the selling_price feature.
+    if hasattr(scaler, 'feature_names_in_') and 'selling_price' in list(scaler.feature_names_in_):
+        sell_idx = list(scaler.feature_names_in_).index('selling_price')
+        sell_mean = scaler.mean_[sell_idx]
+        sell_scale = scaler.scale_[sell_idx]
+
+        linear_actual = linear_reg_prediction[0] * sell_scale + sell_mean
+        lasso_actual = lasso_reg_prediction[0] * sell_scale + sell_mean
+    else:
+        # If we don't have selling_price in the scaler, assume model outputs
+        # are already on the original scale.
+        linear_actual = linear_reg_prediction[0]
+        lasso_actual = lasso_reg_prediction[0]
+
+    # Currency display: convert INR to USD. Provide a sidebar input so the
+    # user can adjust the exchange rate; default is 0.012 (approx 1 INR = 0.012 USD).
+    inr_to_usd = st.sidebar.number_input('INR → USD rate', value=0.012, format="%.6f")
+    linear_usd = linear_actual * inr_to_usd
+    lasso_usd = lasso_actual * inr_to_usd
 
     st.subheader("Predicted Selling Price")
-    st.write(f"Linear Regression Prediction: ₹{linear_reg_prediction[0]:,.2f}")
-    st.write(f"Lasso Regression Prediction: ₹{lasso_reg_prediction[0]:,.2f}")
+    st.write(f"Linear Regression Prediction: ${linear_usd:,.2f} (≈ ₹{linear_actual:,.0f})")
+    st.write(f"Lasso Regression Prediction: ${lasso_usd:,.2f} (≈ ₹{lasso_actual:,.0f})")
